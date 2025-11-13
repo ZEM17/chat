@@ -1,0 +1,32 @@
+services:
+  rabbitmq:
+    image: rabbitmq:management
+    container_name: rabbitmq-container
+    ports:
+      - "5672:5672"  # AMQP port
+      - "15672:15672" # Management UI
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+
+  redis:
+    image: redis:alpine
+    container_name: redis-container
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+
+  mysql:
+    image: mysql:latest
+    container_name: mysql-container
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: "rootpassword" # 生产中请使用强密码
+      MYSQL_DATABASE: "im_db" # 自动创建数据库
+    volumes:
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - mysql-data:/var/lib/mysql
+
+volumes:
+  mysql-data:
