@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql" // *** 新增: 用于 sql.NullInt64 ***
+	"errors"
 	"fmt"
 	"log"
 	"strconv" // *** 新增: 用于 ID 转换 ***
@@ -12,6 +13,8 @@ import (
 )
 
 var DB *sql.DB
+
+var ErrUserNotFound = errors.New("user not found")
 
 // InitDB 初始化数据库连接
 func InitDB(dataSourceName string) {
@@ -25,6 +28,18 @@ func InitDB(dataSourceName string) {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	log.Println("Database connected.")
+}
+
+// CheckUserExists 检查一个用户 ID 是否存在
+// (这是一个辅助函数，用于被 SaveMessage 调用)
+func CheckUserExists(userID int64) (bool, error) {
+	var exists int
+	// 我们在 ValidateUser 之后才使用它，所以只查 ID
+	err := DB.QueryRow("SELECT COUNT(1) FROM users WHERE id = ?", userID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check user existence (ID: %d): %v", userID, err)
+	}
+	return exists > 0, nil
 }
 
 // HashPassword 使用 bcrypt 对密码进行哈希
@@ -91,35 +106,67 @@ func ValidateUser(username, password string) (int64, string, error) {
 	return 0, "", fmt.Errorf("invalid password")
 }
 
-// *** (新增) ***
-// SaveMessage 持久化聊天记录
 func SaveMessage(fromUserID, toUserID, toGroupID string, payload []byte, msgType string) (int64, error) {
-	// 我们的业务逻辑使用字符串 ID, 但数据库存储 BIGINT
+	// 1. 验证发送者 (FromUserID)
 	fromID, err := strconv.ParseInt(fromUserID, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid from_user_id: %v", err)
 	}
 
-	// 处理可能的空 ID (单聊时 toGroupID 为空, 群聊时 toUserID 可能为空)
+	// (JWT 应该已经保证了 fromID 是存在的，但作为数据库的最后防线，检查一下是好的)
+	exists, err := CheckUserExists(fromID)
+	if err != nil {
+		return 0, err // 数据库查询错误
+	}
+	if !exists {
+		// 使用 %w 来包装我们的特定错误
+		return 0, fmt.Errorf("sender user (ID: %d) %w", fromID, ErrUserNotFound)
+	}
+
+	// 2. 验证接收者 (ToUserID 或 ToGroupID)
 	var toID sql.NullInt64
-	if toUserID != "" {
+	var groupID sql.NullInt64
+
+	if msgType == "private" {
+		if toUserID == "" {
+			return 0, fmt.Errorf("to_user_id is required for private message")
+		}
 		tid, err := strconv.ParseInt(toUserID, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("invalid to_user_id: %v", err)
 		}
-		toID = sql.NullInt64{Int64: tid, Valid: true}
-	}
 
-	var groupID sql.NullInt64
-	if toGroupID != "" {
+		// *** 核心验证 ***
+		exists, err := CheckUserExists(tid)
+		if err != nil {
+			return 0, err // 数据库查询错误
+		}
+		if !exists {
+			// *** 这就是我们想要的：返回特定错误 ***
+			return 0, fmt.Errorf("recipient user (ID: %d) %w", tid, ErrUserNotFound)
+		}
+
+		toID = sql.NullInt64{Int64: tid, Valid: true}
+
+	} else if msgType == "group" {
+		if toGroupID == "" {
+			return 0, fmt.Errorf("to_group_id is required for group message")
+		}
 		gid, err := strconv.ParseInt(toGroupID, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("invalid to_group_id: %v", err)
 		}
+
+		// TODO: 在未来, 这里应该检查 'groups' 表
+		// exists, err := CheckGroupExists(gid)
+		// ...
+
 		groupID = sql.NullInt64{Int64: gid, Valid: true}
+	} else {
+		return 0, fmt.Errorf("unknown message type: %s", msgType)
 	}
 
-	// content 存储的是原始的 payload (通常是客户端发来的 JSON)
+	// 3. 插入数据库
 	res, err := DB.Exec(
 		"INSERT INTO messages (from_user_id, to_user_id, to_group_id, content, type) VALUES (?, ?, ?, ?, ?)",
 		fromID, toID, groupID, string(payload), msgType,

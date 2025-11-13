@@ -4,6 +4,7 @@ import (
 	"chat/logic/db" // 导入新的 db 包
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -225,11 +227,79 @@ func handleMessage(d amqp.Delivery) {
 	// *** (修改点 1: 修复死循环) ***
 	_, err := db.SaveMessage(msg.FromUserID, msg.ToUserID, msg.ToGroupID, msg.Payload, msg.Type)
 	if err != nil {
-		log.Printf("Failed to save message to DB (poison message?). Discarding: %v. Body: %s", err, string(d.Body))
-		// 如果是数据格式错误 (比如 "userB")，我们不想重试
-		// 直接 Ack 丢弃这条消息
-		d.Ack(true)
-		return
+		if errors.Is(err, db.ErrUserNotFound) {
+			// 这是我们预期的错误：接收者/发送者不存在
+			log.Printf("Failed to save message: %v. Discarding message.", err)
+			// TODO: 在这里, 我们可以选择性地给发送者(msg.FromUserID)
+			// 发送一条系统消息，告诉他 "用户不存在"
+			// 1. 确定是哪个用户不存在 (用于错误消息)
+			var errorMsg string
+			if strings.Contains(err.Error(), "recipient user") {
+				errorMsg = fmt.Sprintf("发送失败: 对方用户 (ID: %s) 不存在。", msg.ToUserID)
+			} else if strings.Contains(err.Error(), "sender user") {
+				errorMsg = "发送失败: 您的账户似乎无效。" // 这种情况理论上不应发生
+			} else {
+				errorMsg = "发送失败: 目标用户不存在。"
+			}
+
+			// 2. 构建系统消息 payload (这是将发送给客户端的)
+			// (客户端可以解析这个 JSON 来显示错误)
+			systemPayload := map[string]string{
+				"type":           "system_error", // 客户端可以识别的类型
+				"content":        errorMsg,
+				"ref_to_user_id": msg.ToUserID, // 告诉客户端是发往哪个 ID 的消息失败了
+			}
+			systemPayloadBytes, jsonErr := json.Marshal(systemPayload)
+			if jsonErr != nil {
+				log.Printf("Failed to marshal system error message: %v", jsonErr)
+				d.Ack(true) // 序列化失败，只能丢弃了
+				return
+			}
+
+			// 3. 查找发送者 (msg.FromUserID) 在哪个网关
+			locationKey := "user:" + msg.FromUserID + ":location"
+			gatewayID, redisErr := redisClient.Get(ctx, locationKey).Result()
+
+			if redisErr == redis.Nil {
+				// 发送者自己也离线了，那就算了
+				log.Printf("Sender %s is offline, cannot deliver system error.", msg.FromUserID)
+			} else if redisErr != nil {
+				// Redis 查错了
+				log.Printf("Failed to get sender %s location from Redis: %v", msg.FromUserID, redisErr)
+			} else {
+				// 4. 发送者在线，将系统消息投递回去
+				downMsg := DownstreamMessage{
+					ToUserID: msg.FromUserID,     // 接收者是 *发送者*
+					Payload:  systemPayloadBytes, // 内容是 *系统错误*
+				}
+				msgBody, err := json.Marshal(downMsg)
+				if err != nil {
+					log.Printf("Failed to marshal downstream system error: %v", err)
+				} else {
+					// 发布到 im.delivery，路由到发送者所在的网关
+					err = amqpChannel.Publish(
+						exchangeDelivery,
+						gatewayID, // 路由键 = 发送者所在的网关 ID
+						false,
+						false,
+						amqp.Publishing{
+							ContentType: "application/json",
+							Body:        msgBody,
+						})
+					if err != nil {
+						log.Printf("Failed to publish system error back to sender %s: %v", msg.FromUserID, err)
+					} else {
+						log.Printf("Published system error back to sender %s (Gateway: %s)", msg.FromUserID, gatewayID)
+					}
+				}
+			}
+			d.Ack(true) // 确认并丢弃此消息
+		} else {
+			// 这是其他错误 (数据库连接、毒消息格式等)
+			log.Printf("Failed to save message to DB (poison message?). Discarding: %v. Body: %s", err, string(d.Body))
+			d.Ack(true) // 同样丢弃
+		}
+		return // *** 关键: 停止处理此消息 ***
 	}
 	// *** (修改点 1 结束) ***
 
