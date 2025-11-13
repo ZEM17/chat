@@ -24,6 +24,9 @@ const (
 	exchangeMessages   = "im.messages"
 	exchangeDelivery   = "im.delivery"
 	queueLogicMessages = "logic.messages.queue"
+
+	exchangeSystem   = "im.system"
+	queueLogicSystem = "logic.system.queue"
 )
 
 // 新增: JWT 签名密钥 (生产中应使用更复杂且保密的密钥)
@@ -34,6 +37,12 @@ type Claims struct {
 	UserID   string `json:"user_id"`
 	Nickname string `json:"nickname"`
 	jwt.RegisteredClaims
+}
+
+// *** 新增: 离线消息拉取请求结构体 ***
+type OfflinePullRequest struct {
+	UserID    string `json:"user_id"`
+	GatewayID string `json:"gateway_id"`
 }
 
 var (
@@ -93,6 +102,10 @@ func initAMQP() {
 	failOnError(err, "Failed to open RabbitMQ channel")
 	log.Println("RabbitMQ connected and channel opened.")
 	// (省略 ExchangeDeclare, 因为它们在 startConsumer 中也会被声明)
+
+	// *** 新增: 声明系统交换机 ***
+	err = amqpChannel.ExchangeDeclare(exchangeSystem, "topic", true, false, false, false, nil)
+	failOnError(err, "Failed to declare 'im.system' exchange")
 }
 
 // *** (新增) ***
@@ -200,28 +213,25 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleMessage 保持不变 (但我们现在要添加消息持久化)
 func handleMessage(d amqp.Delivery) {
 	var msg UpstreamMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
-		log.Printf("Failed to unmarshal upstream message: %v", err)
-		d.Ack(false)
+		log.Printf("Failed to unmarshal upstream message (poison message). Discarding: %v", err)
+		d.Ack(true) // 丢弃无法解析的毒消息
 		return
 	}
 	log.Printf("Received message from %s, type: %s, to: %s", msg.FromUserID, msg.Type, msg.ToUserID)
 
-	// *** (修改点 1) ***
-	// 消息持久化 (大纲 4.2.4)
-	// TODO: 应该在一个事务中完成
-	// (我们暂时省略了 'messages' 表的创建，将在下一步添加)
-	/*
-		_, err := db.DB.Exec("INSERT INTO messages (from_user_id, to_user_id, content, type) VALUES (?, ?, ?, ?)",
-			msg.FromUserID, msg.ToUserID, string(msg.Payload), 1) // 假设 type=1 是单聊
-		if err != nil {
-			log.Printf("Failed to save message to DB: %v", err)
-			// (暂时不 Nack, 先让路由继续)
-		}
-	*/
+	// *** (修改点 1: 修复死循环) ***
+	_, err := db.SaveMessage(msg.FromUserID, msg.ToUserID, msg.ToGroupID, msg.Payload, msg.Type)
+	if err != nil {
+		log.Printf("Failed to save message to DB (poison message?). Discarding: %v. Body: %s", err, string(d.Body))
+		// 如果是数据格式错误 (比如 "userB")，我们不想重试
+		// 直接 Ack 丢弃这条消息
+		d.Ack(true)
+		return
+	}
+	// *** (修改点 1 结束) ***
 
 	if msg.Type == "private" {
 		locationKey := "user:" + msg.ToUserID + ":location"
@@ -229,21 +239,25 @@ func handleMessage(d amqp.Delivery) {
 
 		if err == redis.Nil {
 			log.Printf("User %s is OFFLINE. (Location key %s not found)", msg.ToUserID, locationKey)
-			// *** (修改点 2) ***
-			// TODO: 将消息存入 MySQL 离线表 (大纲 4.2.5)
-			/*
-				_, err := db.DB.Exec("INSERT INTO offline_messages (user_id, message_data) VALUES (?, ?)",
-					msg.ToUserID, d.Body)
-				if err != nil {
-					log.Printf("Failed to save offline message: %v", err)
-				}
-			*/
-			d.Ack(true)
+
+			// *** (修改点 2: 修复死循环) ***
+			err := db.SaveOfflineMessage(msg.ToUserID, d.Body)
+			if err != nil {
+				log.Printf("Failed to save offline message (poison message?). Discarding: %v. Body: %s", err, string(d.Body))
+				// 离线存储失败，Nack(false, true) 会导致死循环
+				// 我们改为 Ack(true) 丢弃它
+				d.Ack(true)
+				return
+			}
+			// *** (修改点 2 结束) ***
+
+			log.Printf("Saved offline message for user %s", msg.ToUserID)
+			d.Ack(true) // 确认消息 (已存入离线)
 			return
 		}
 		if err != nil {
-			log.Printf("Failed to get user location from Redis: %v", err)
-			d.Nack(false, true)
+			log.Printf("Failed to get user location from Redis: %v. Re-queueing...", err)
+			d.Nack(false, true) // Redis 错误，可以重试
 			return
 		}
 
@@ -256,8 +270,8 @@ func handleMessage(d amqp.Delivery) {
 		}
 		msgBody, err := json.Marshal(downMsg)
 		if err != nil {
-			log.Printf("Failed to marshal downstream message: %v", err)
-			d.Ack(false)
+			log.Printf("Failed to marshal downstream message (poison message). Discarding: %v", err)
+			d.Ack(true) // 丢弃
 			return
 		}
 
@@ -273,8 +287,8 @@ func handleMessage(d amqp.Delivery) {
 			})
 
 		if err != nil {
-			log.Printf("Failed to publish message to %s (Key: %s): %v", exchangeDelivery, gatewayID, err)
-			d.Nack(false, true)
+			log.Printf("Failed to publish message to %s (Key: %s): %v. Re-queueing...", exchangeDelivery, gatewayID, err)
+			d.Nack(false, true) // RMQ 发布失败，可以重试
 			return
 		}
 
@@ -312,6 +326,129 @@ func startConsumer() {
 	}()
 }
 
+// *** (新增) ***
+// startSystemConsumer 启动用于处理系统消息 (如下线拉取) 的消费者
+func startSystemConsumer() {
+	// 声明队列
+	q, err := amqpChannel.QueueDeclare(queueLogicSystem, true, false, false, false, nil)
+	failOnError(err, "Failed to declare 'logic.system.queue'")
+
+	// 绑定到 im.system 交换机，路由键 "system.offline.pull"
+	bindingKey := "system.offline.pull"
+	err = amqpChannel.QueueBind(q.Name, bindingKey, exchangeSystem, false, nil)
+	failOnError(err, fmt.Sprintf("Failed to bind queue %s to %s", q.Name, exchangeSystem))
+	log.Printf("Queue %s bound to exchange %s (Binding Key: %s)", q.Name, exchangeSystem, bindingKey)
+
+	// 设置 QoS
+	err = amqpChannel.Qos(1, 0, false)
+	failOnError(err, "Failed to set QoS for system queue")
+
+	// 消费消息
+	msgs, err := amqpChannel.Consume(q.Name, "", false, false, false, false, nil)
+	failOnError(err, "Failed to register system consumer")
+	log.Println("System consumer started. Waiting for messages...")
+
+	go func() {
+		for d := range msgs {
+			handleSystemMessage(d)
+		}
+	}()
+}
+
+func handleSystemMessage(d amqp.Delivery) {
+	if d.RoutingKey != "system.offline.pull" {
+		log.Printf("Unknown system message routing key: %s", d.RoutingKey)
+		d.Ack(true) // 丢弃
+		return
+	}
+
+	var req OfflinePullRequest
+	if err := json.Unmarshal(d.Body, &req); err != nil {
+		log.Printf("Failed to unmarshal offline pull request (poison message). Discarding: %v", err)
+		d.Ack(true) // 丢弃
+		return
+	}
+	log.Printf("Received offline pull request for User: %s (Gateway: %s)", req.UserID, req.GatewayID)
+
+	// 1. 启动事务
+	tx, err := db.DB.Begin()
+	if err != nil {
+		log.Printf("Failed to begin transaction: %v. Acknowledging request (will retry on next login)", err)
+		d.Ack(true) // 确认拉取请求 (失败)，防止循环
+		return
+	}
+	defer tx.Rollback()
+
+	// 2. 在事务中获取并锁定消息
+	ids, messages, err := db.GetOfflineMessages(tx, req.UserID)
+	if err != nil {
+		log.Printf("Failed to get offline messages from DB: %v. Acknowledging request (will retry on next login)", err)
+		// 如果表不存在 (Error 1146)，重试也没用。Ack 此拉取请求。
+		d.Ack(true)
+		return
+	}
+
+	if len(messages) == 0 {
+		log.Printf("No offline messages found for user %s", req.UserID)
+		d.Ack(true)
+		return
+	}
+	log.Printf("Found %d offline messages for user %s. Pushing to gateway %s...", len(messages), req.UserID, req.GatewayID)
+
+	// 3. 循环推送消息到 'im.delivery'
+	for _, msgData := range messages {
+		var upMsg UpstreamMessage
+		if err := json.Unmarshal(msgData, &upMsg); err != nil {
+			log.Printf("Failed to parse offline message data (poison data in DB). Skipping: %v", err)
+			continue
+		}
+
+		downMsg := DownstreamMessage{
+			ToUserID: req.UserID,
+			Payload:  upMsg.Payload,
+		}
+		msgBody, err := json.Marshal(downMsg)
+		if err != nil {
+			log.Printf("Failed to marshal downstream message (poison data in DB). Skipping: %v", err)
+			continue
+		}
+
+		err = amqpChannel.Publish(
+			exchangeDelivery,
+			req.GatewayID,
+			false,
+			false,
+			amqp.Publishing{
+				ContentType: "application/json",
+				Body:        msgBody,
+			})
+
+		if err != nil {
+			log.Printf("Failed to publish offline message to %s (Key: %s): %v. Acknowledging (will retry on next login)", exchangeDelivery, req.GatewayID, err)
+			d.Ack(true) // 确认拉取请求 (部分失败)
+			return
+		}
+	}
+
+	// 4. 在事务中删除这些消息
+	if err := db.ClearOfflineMessages(tx, ids); err != nil {
+		log.Printf("Failed to clear offline messages: %v. Acknowledging (will retry on next login)", err)
+		d.Ack(true) // 确认拉取请求 (失败)
+		return
+	}
+
+	// 5. 提交事务
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit transaction: %v. Acknowledging (will retry on next login)", err)
+		d.Ack(true) // 确认拉取请求 (失败)
+		return
+	}
+
+	// 6. 确认拉取请求
+	log.Printf("Successfully pushed %d offline messages for user %s", len(messages), req.UserID)
+	d.Ack(true)
+}
+
 // *** (修改) ***
 // main 函数
 func main() {
@@ -328,6 +465,9 @@ func main() {
 
 	// 启动 RabbitMQ 消费者
 	startConsumer()
+
+	// 启动系统消费者
+	go startSystemConsumer()
 
 	// *** (新增) ***
 	// 启动 HTTP API 服务

@@ -28,6 +28,7 @@ const (
 const (
 	exchangeMessages = "im.messages"
 	exchangeDelivery = "im.delivery"
+	exchangeSystem   = "im.system"
 )
 
 // *** 新增: JWT 签名密钥 ***
@@ -40,6 +41,13 @@ type Claims struct {
 	UserID   string `json:"user_id"`
 	Nickname string `json:"nickname"`
 	jwt.RegisteredClaims
+}
+
+// *** 新增: 离线消息拉取请求结构体 ***
+// (逻辑层也需要一个完全一样的)
+type OfflinePullRequest struct {
+	UserID    string `json:"user_id"`
+	GatewayID string `json:"gateway_id"`
 }
 
 var (
@@ -223,6 +231,8 @@ func (h *Hub) run() {
 			// *** (日志更新) ***
 			log.Printf("Client %s (from token) connected, location set to %s", client.userID, *gatewayID)
 
+			go h.requestOfflineMessages(client.userID, *gatewayID)
+
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client.userID]; ok {
@@ -246,6 +256,35 @@ func (h *Hub) run() {
 			}
 			h.mu.Unlock()
 		}
+	}
+}
+
+// requestOfflineMessages 向 RabbitMQ 发送一个拉取请求
+func (h *Hub) requestOfflineMessages(userID, gatewayID string) {
+	pullReq := OfflinePullRequest{
+		UserID:    userID,
+		GatewayID: gatewayID,
+	}
+	reqBody, err := json.Marshal(pullReq)
+	if err != nil {
+		log.Printf("Failed to marshal offline pull request: %v", err)
+		return
+	}
+
+	err = amqpChannel.Publish(
+		exchangeSystem,        // exchange
+		"system.offline.pull", // routing key
+		false,                 // mandatory
+		false,                 // immediate
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        reqBody,
+		})
+
+	if err != nil {
+		log.Printf("Failed to publish offline pull request for %s: %v", userID, err)
+	} else {
+		log.Printf("Published offline pull request for %s (to %s)", userID, exchangeSystem)
 	}
 }
 
@@ -406,6 +445,20 @@ func initAMQP() {
 		log.Fatalf("Failed to declare 'im.messages' exchange: %v", err)
 	}
 	log.Printf("Exchange %s declared.", exchangeMessages)
+
+	err = amqpChannel.ExchangeDeclare(
+		exchangeSystem,
+		"topic",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare 'im.system' exchange: %v", err)
+	}
+	log.Printf("Exchange %s declared.", exchangeSystem)
 }
 
 func main() {
