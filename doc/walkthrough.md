@@ -71,3 +71,25 @@ d:/CODE/chat/
 ## 4. 压测 (Load Test)
 - **工具**: 编写了 Benchmark Client (`chat/benchmark/client.go`) 模拟 500+ 并发用户。
 - **分析**: 集成了 `net/http/pprof` 进行性能剖析。虽然因环境缺少 Graphviz 暂未生成火焰图，但在高并发压测下，服务运行稳定，无明显内存泄漏。
+
+# 演练: 第三阶段 - 核心功能 (群聊)
+
+本阶段我们实现了 IM 系统最核心的社交功能：群聊。
+
+## 1. 群组服务与元数据
+- **gRPC Service**: 实现了 `GroupService`，提供创建群组、加入群组、获取成员列表等原子操作。
+- **API 网关**: Gateway 暴露了 RESTful 风格的 HTTP 接口，并将请求透传给 Logic 服务。
+    - `POST /api/group/create`
+    - `POST /api/group/join`
+    - `GET /api/group/members`
+
+## 2. 消息扩散 (Fan-out)
+我们采用了 **写扩散 (Write Diffusion)** 对于群消息的投递策略：
+1.  **接收**: Logic 服务监听到 `type: group` 的消息。
+2.  **查询**: 通过 `repo.GetGroupMembers` 获取该群组所有成员 ID。
+3.  **扩散**: 遍历成员列表，为每个在线成员生成一条下行消息。
+4.  **路由**: 查询 Redis 获取成员所在的 Gateway 实例 ID，精准投递。
+
+**设计考量**:
+- 此方案实现简单，实时性高，非常适合千人以下的群组。
+- 对于未来可能支持的万人大群，建议升级为“读扩散”模式（用户主动拉取收件箱）。

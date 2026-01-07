@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -57,7 +58,8 @@ var (
 	redisClient *redis.Client
 	amqpConn    *amqp.Connection
 	amqpChannel *amqp.Channel
-	authClient  pb.AuthServiceClient // gRPC Client
+	authClient  pb.AuthServiceClient  // gRPC Client
+	groupClient pb.GroupServiceClient // gRPC Client
 	ctx         = context.Background()
 
 	upgrader = websocket.Upgrader{
@@ -416,6 +418,62 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func handleCreateGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req pb.CreateGroupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := groupClient.CreateGroup(ctx, &req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleJoinGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req pb.JoinGroupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := groupClient.JoinGroup(ctx, &req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleGetGroupMembers(w http.ResponseWriter, r *http.Request) {
+	groupIDStr := r.URL.Query().Get("group_id")
+	groupID, _ := strconv.ParseInt(groupIDStr, 10, 64)
+
+	resp, err := groupClient.GetGroupMembers(ctx, &pb.GetGroupMembersRequest{GroupId: groupID})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
 func initRedis() {
 	redisClient = redis.NewClient(&redis.Options{Addr: *redisAddr})
 	if err := redisClient.Ping(ctx).Err(); err != nil {
@@ -449,6 +507,7 @@ func main() {
 	}
 	defer conn.Close()
 	authClient = pb.NewAuthServiceClient(conn)
+	groupClient = pb.NewGroupServiceClient(conn) // Add Client
 	log.Printf("Connected to Logic service at %s", *logicAddr)
 
 	// *** Init TimeWheel ***
@@ -472,6 +531,11 @@ func main() {
 	// Expose HTTP APIs backed by gRPC
 	http.HandleFunc("/api/login", handleLogin)
 	http.HandleFunc("/api/register", handleRegister)
+
+	// Group APIs
+	http.HandleFunc("/api/group/create", handleCreateGroup)
+	http.HandleFunc("/api/group/join", handleJoinGroup)
+	http.HandleFunc("/api/group/members", handleGetGroupMembers)
 
 	log.Printf("Gateway server (ID: %s) started on %s", *gatewayID, *addr)
 	err = http.ListenAndServe(*addr, nil)

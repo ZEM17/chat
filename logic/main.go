@@ -127,7 +127,75 @@ func handleMessage(d amqp.Delivery) {
 		}
 		toID = sql.NullInt64{Int64: tid, Valid: true}
 	} else if msg.Type == "group" {
-		// handle group
+		// Group Message Fan-out (Write Diffusion)
+		if msg.ToGroupID == "" {
+			log.Printf("Invalid group_id for group message")
+			d.Ack(true)
+			return
+		}
+
+		groupID, err := strconv.ParseInt(msg.ToGroupID, 10, 64)
+		if err != nil {
+			log.Printf("Invalid group_id: %v", err)
+			d.Ack(true)
+			return
+		}
+
+		members, err := repo.GetGroupMembers(groupID)
+		if err != nil {
+			log.Printf("Failed to get group members: %v. Requeuing", err)
+			d.Nack(false, true)
+			return
+		}
+
+		// Simple Loop Fan-out
+		for _, memberID := range members {
+			// Skip sender? usually yes.
+			if memberID == fromID {
+				continue
+			}
+
+			// Push to each member
+			// Optimization: Start goroutines for parallel push if group is large
+			// For now, serial push is fine for < 500 members
+
+			// We construct a Downstream message for each member
+			downMsg := DownstreamMessage{
+				ToUserID: fmt.Sprintf("%d", memberID),
+				Payload:  msg.Payload,
+			}
+
+			// Deliver to Gateway (via Exchange)
+			// Need to find which Gateway the user is on.
+			// Query Redis
+			locationKey := fmt.Sprintf("user:%d:location", memberID)
+			gatewayID, err := redisClient.Get(ctx, locationKey).Result()
+
+			if err == redis.Nil {
+				// Offline processing
+				// Ideally save to offline_messages table (one per user for Read Diffusion optimization? No, usually one global message ref)
+				// Current `SaveOfflineMessage` saves `Payload` blob.
+				// If we use Write Diffusion, we insert into `offline_messages` table for this user.
+				// This matches our `SaveOfflineMessage` logic.
+				repo.SaveOfflineMessage(fmt.Sprintf("%d", memberID), msg.Payload)
+				continue
+			} else if err != nil {
+				log.Printf("Redis error for member %d: %v", memberID, err)
+				continue
+			}
+
+			// Online
+			msgBody, _ := json.Marshal(downMsg)
+			amqpChannel.Publish(
+				exchangeDelivery,
+				gatewayID,
+				false,
+				false,
+				amqp.Publishing{
+					ContentType: "application/json",
+					Body:        msgBody,
+				})
+		}
 	}
 
 	// 2. Async Push with Batch ACK (Zero Data Loss)
@@ -367,9 +435,12 @@ func main() {
 	}
 	s := grpc.NewServer()
 
-	// Register AuthService
+	// Register AuthService & GroupService
 	authSvc := service.NewAuthService()
 	pb.RegisterAuthServiceServer(s, authSvc)
+
+	groupSvc := service.NewGroupService()
+	pb.RegisterGroupServiceServer(s, groupSvc)
 
 	log.Printf("Logic gRPC server starting on %s...", *grpcAddr)
 	go func() {
