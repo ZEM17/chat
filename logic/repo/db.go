@@ -16,6 +16,35 @@ var DB *sql.DB
 
 var ErrUserNotFound = errors.New("user not found")
 
+type Message struct {
+	FromUserID int64
+	ToUserID   sql.NullInt64
+	ToGroupID  sql.NullInt64
+	Content    string
+	Type       string
+}
+
+// BatchSaveMessages 批量存储消息
+func BatchSaveMessages(msgs []*Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	query := "INSERT INTO messages (from_user_id, to_user_id, to_group_id, content, type) VALUES "
+	vals := []interface{}{}
+
+	for i, msg := range msgs {
+		query += "(?, ?, ?, ?, ?)"
+		if i < len(msgs)-1 {
+			query += ","
+		}
+		vals = append(vals, msg.FromUserID, msg.ToUserID, msg.ToGroupID, msg.Content, msg.Type)
+	}
+
+	_, err := DB.Exec(query, vals...)
+	return err
+}
+
 // InitDB 初始化数据库连接
 func InitDB(dataSourceName string) {
 	var err error

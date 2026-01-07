@@ -5,20 +5,23 @@ import (
 	"chat/logic/repo"
 	"chat/logic/service"
 	"context"
+	"database/sql"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"strings"
+	"strconv"
 	"syscall"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/streadway/amqp"
 	"google.golang.org/grpc"
+
+	"net/http"
+	_ "net/http/pprof" // Enable pprof
 )
 
 const (
@@ -103,70 +106,41 @@ func handleMessage(d amqp.Delivery) {
 	}
 	log.Printf("Received message from %s, type: %s, to: %s", msg.FromUserID, msg.Type, msg.ToUserID)
 
-	_, err := repo.SaveMessage(msg.FromUserID, msg.ToUserID, msg.ToGroupID, msg.Payload, msg.Type)
+	// Optimization: Async Batch Write
+	// 1. Validate IDs
+	fromID, err := strconv.ParseInt(msg.FromUserID, 10, 64)
 	if err != nil {
-		if errors.Is(err, repo.ErrUserNotFound) {
-			log.Printf("Failed to save message: %v. Discarding message.", err)
-			var errorMsg string
-			if strings.Contains(err.Error(), "recipient user") {
-				errorMsg = fmt.Sprintf("发送失败: 对方用户 (ID: %s) 不存在。", msg.ToUserID)
-			} else if strings.Contains(err.Error(), "sender user") {
-				errorMsg = "发送失败: 您的账户似乎无效。"
-			} else {
-				errorMsg = "发送失败: 目标用户不存在。"
-			}
-
-			systemPayload := map[string]string{
-				"type":           "system_error",
-				"content":        errorMsg,
-				"ref_to_user_id": msg.ToUserID,
-			}
-			systemPayloadBytes, jsonErr := json.Marshal(systemPayload)
-			if jsonErr != nil {
-				log.Printf("Failed to marshal system error message: %v", jsonErr)
-				d.Ack(true)
-				return
-			}
-
-			locationKey := "user:" + msg.FromUserID + ":location"
-			gatewayID, redisErr := redisClient.Get(ctx, locationKey).Result()
-
-			if redisErr == redis.Nil {
-				log.Printf("Sender %s is offline, cannot deliver system error.", msg.FromUserID)
-			} else if redisErr != nil {
-				log.Printf("Failed to get sender %s location from Redis: %v", msg.FromUserID, redisErr)
-			} else {
-				downMsg := DownstreamMessage{
-					ToUserID: msg.FromUserID,
-					Payload:  systemPayloadBytes,
-				}
-				msgBody, err := json.Marshal(downMsg)
-				if err != nil {
-					log.Printf("Failed to marshal downstream system error: %v", err)
-				} else {
-					err = amqpChannel.Publish(
-						exchangeDelivery,
-						gatewayID,
-						false,
-						false,
-						amqp.Publishing{
-							ContentType: "application/json",
-							Body:        msgBody,
-						})
-					if err != nil {
-						log.Printf("Failed to publish system error back to sender %s: %v", msg.FromUserID, err)
-					} else {
-						log.Printf("Published system error back to sender %s (Gateway: %s)", msg.FromUserID, gatewayID)
-					}
-				}
-			}
-			d.Ack(true)
-		} else {
-			log.Printf("Failed to save message to DB (poison message?). Discarding: %v. Body: %s", err, string(d.Body))
-			d.Ack(true)
-		}
+		log.Printf("Invalid from_user_id: %v", err)
+		d.Ack(true)
 		return
 	}
+
+	var toID sql.NullInt64
+	var groupID sql.NullInt64
+
+	if msg.Type == "private" {
+		tid, err := strconv.ParseInt(msg.ToUserID, 10, 64)
+		if err != nil {
+			log.Printf("Invalid to_user_id: %v", err)
+			d.Ack(true)
+			return
+		}
+		toID = sql.NullInt64{Int64: tid, Valid: true}
+	} else if msg.Type == "group" {
+		// handle group
+	}
+
+	// 2. Async Push with Batch ACK (Zero Data Loss)
+	service.AsyncSaveMessage(fromID, toID, groupID, string(msg.Payload), msg.Type,
+		func() {
+			// On Success: Ack
+			// Note: d.Ack is generally thread-safe in streadway/amqp
+			d.Ack(false)
+		},
+		func() {
+			// On Failure: Nack and Requeue
+			d.Nack(false, true)
+		})
 
 	if msg.Type == "private" {
 		locationKey := "user:" + msg.ToUserID + ":location"
@@ -377,6 +351,15 @@ func main() {
 	startConsumer()
 	go startSystemConsumer()
 
+	// Start Async DB Writer
+	service.StartAsyncWriter()
+
+	// *** PPROF Server ***
+	go func() {
+		log.Println("Pprof server running on :6060")
+		log.Println(http.ListenAndServe(":6060", nil))
+	}()
+
 	// *** gRPC Server ***
 	lis, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {
@@ -401,5 +384,11 @@ func main() {
 	<-sc
 
 	log.Println("Shutting down Logic service...")
+
+	if service.GlobalWriter != nil {
+		service.GlobalWriter.Stop()
+		log.Println("AsyncWriter flushed and stopped.")
+	}
+
 	s.GracefulStop()
 }

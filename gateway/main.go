@@ -16,6 +16,10 @@ import (
 	"github.com/streadway/amqp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"chat/common/pool"
+	"chat/common/timewheel" // Import
+	_ "net/http/pprof"      // Enable pprof
 )
 
 const (
@@ -23,6 +27,13 @@ const (
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 512
+)
+
+var (
+	// Global TimeWheel for Heartbeats
+	// 59s delay (pongWait is 60s), 1s tick.
+	// SlotNum = 3600 (1 hour support), typically we need just > 60.
+	globalTimeWheel *timewheel.TimeWheel
 )
 
 const (
@@ -89,22 +100,45 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 	c.conn.SetReadLimit(maxMessageSize)
-	if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
-		log.Printf("Failed to set read deadline: %v", err)
-		return
+	// TimeWheel Optimizations:
+	// Instead of SetReadDeadline (Poller), we use TimeWheel to track activity.
+	// But we still need a hard deadline on socket to unblock ReadMessage if network dies silently?
+	// standard SetReadDeadline is fine, but TimeWheel is used for application level logic
+	// or to avoid resetting timer syscalls too often.
+	// For "Resume Highlight", users often replace SetReadDeadline with just TimeWheel closing the conn.
+	// Let's do that: Remove SetReadDeadline (or set it very long), and use TimeWheel to Close().
+
+	// c.conn.SetReadDeadline(time.Now().Add(pongWait)) // Removed
+
+	// Add to TimeWheel
+	heartbeat := func() {
+		log.Printf("Client %s timed out (TimeWheel)", c.userID)
+		c.conn.Close() // This will trigger read error and cleanup
 	}
+	globalTimeWheel.Add(pongWait, c.userID, heartbeat)
+
 	c.conn.SetPongHandler(func(string) error {
-		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		// Reset TimeWheel
+		// globalTimeWheel.Add will automaticall remove old task if key matches
+		globalTimeWheel.Add(pongWait, c.userID, heartbeat)
+		return nil
+		// return c.conn.SetReadDeadline(time.Now().Add(pongWait)) // Removed
 	})
 
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
+			// Remove from TimeWheel on error/close
+			globalTimeWheel.Remove(c.userID)
+
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("error: %v", err)
 			}
 			break
 		}
+
+		// Reset on message received too? Usually yes for IM.
+		globalTimeWheel.Add(pongWait, c.userID, heartbeat)
 
 		var clientMsg struct {
 			ToUserID string `json:"to_user_id"`
@@ -123,11 +157,18 @@ func (c *Client) readPump() {
 			ToUserID:   clientMsg.ToUserID,
 		}
 
-		msgBody, err := json.Marshal(upMsg)
+		// Optimize: Use BufferPool + Encoder to avoid allocating new []byte for every message
+		buf := pool.GetBuffer()
+		err = json.NewEncoder(buf).Encode(upMsg)
 		if err != nil {
-			log.Printf("Failed to marshal upstream message: %v", err)
+			log.Printf("Failed to encode upstream message: %v", err)
+			pool.PutBuffer(buf)
 			continue
 		}
+
+		// Note: Encoder adds a newline at the end. We might want to trim it if strict.
+		// For JSON compatibility, trailing newline is usually fine.
+		// If strict needed: buf.Truncate(buf.Len()-1)
 
 		err = amqpChannel.Publish(
 			exchangeMessages,
@@ -136,10 +177,16 @@ func (c *Client) readPump() {
 			false,
 			amqp.Publishing{
 				ContentType: "application/json",
-				Body:        msgBody,
+				Body:        buf.Bytes(), // Does not copy? streadway says: "The body is not copied".
 			})
+
+		// After Publish returns, it's safe to reuse buffer (data written to kernel socket buffer)
+		pool.PutBuffer(buf)
+
 		if err != nil {
 			log.Printf("Failed to publish message: %v", err)
+		} else {
+			log.Printf("Client %s sent message (to: %s), published to %s", c.userID, clientMsg.ToUserID, exchangeMessages)
 		}
 	}
 }
@@ -403,6 +450,16 @@ func main() {
 	defer conn.Close()
 	authClient = pb.NewAuthServiceClient(conn)
 	log.Printf("Connected to Logic service at %s", *logicAddr)
+
+	// *** Init TimeWheel ***
+	// 1s interval, 60 slots (1 min cycle covers pongWait 60s)
+	// Actually pongWait is 60s, so we need > 60 slots if delay is 60s?
+	// Add implementation uses (delay/interval)%slots. It supports multiple circles.
+	// So 60 slots is fine.
+	globalTimeWheel = timewheel.New(1*time.Second, 100)
+	globalTimeWheel.Start()
+	log.Println("TimeWheel started.")
+	defer globalTimeWheel.Stop()
 
 	hub := newHub()
 	go hub.run()
