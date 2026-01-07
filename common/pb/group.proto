@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "./common/pb";
+
+service GroupService {
+    // 创建群
+    rpc CreateGroup (CreateGroupRequest) returns (CreateGroupResponse);
+    // 加入群
+    rpc JoinGroup (JoinGroupRequest) returns (JoinGroupResponse);
+    // 获取群成员
+    rpc GetGroupMembers (GetGroupMembersRequest) returns (GetGroupMembersResponse);
+}
+
+message CreateGroupRequest {
+    string name = 1;
+    string owner_id = 2;
+}
+
+message CreateGroupResponse {
+    int64 group_id = 1;
+    string message = 2;
+}
+
+message JoinGroupRequest {
+    int64 group_id = 1;
+    string user_id = 2;
+}
+
+message JoinGroupResponse {
+    string message = 1;
+}
+
+message GetGroupMembersRequest {
+    int64 group_id = 1;
+}
+
+message GetGroupMembersResponse {
+    repeated Member members = 1;
+}
+
+message Member {
+    string user_id = 1;
+    string nickname = 2;
+    string role = 3; // owner, admin, member
+}

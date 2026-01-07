@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "./common/pb";
+
+service AuthService {
+    // 登录
+    rpc Login (LoginRequest) returns (LoginResponse);
+    // 注册
+    rpc Register (RegisterRequest) returns (RegisterResponse);
+    // 验证 Token (用于 Gateway 等中间件验证)
+    rpc ValidateToken (ValidateTokenRequest) returns (ValidateTokenResponse);
+}
+
+message LoginRequest {
+    string username = 1;
+    string password = 2;
+}
+
+message LoginResponse {
+    string token = 1;
+    string user_id = 2;
+    string nickname = 3;
+}
+
+message RegisterRequest {
+    string username = 1;
+    string password = 2;
+    string nickname = 3;
+}
+
+message RegisterResponse {
+    string message = 1;
+    int64 user_id = 2;
+}
+
+message ValidateTokenRequest {
+    string token = 1;
+}
+
+message ValidateTokenResponse {
+    bool valid = 1;
+    string user_id = 2;
+    string nickname = 3;
+    string error_msg = 4;
+}
