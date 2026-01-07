@@ -28,5 +28,18 @@ services:
       - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
       - mysql-data:/var/lib/mysql
 
+  etcd:
+    image: bitnami/etcd:latest
+    container_name: etcd-container
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+    volumes:
+      - etcd-data:/bitnami/etcd-data
+
 volumes:
   mysql-data:
+  etcd-data:

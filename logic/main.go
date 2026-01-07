@@ -1,6 +1,7 @@
 package main
 
 import (
+	"chat/common/discovery"
 	"chat/common/pb"
 	"chat/logic/repo"
 	"chat/logic/service"
@@ -44,6 +45,7 @@ var (
 	amqpAddr  = flag.String("amqp", "amqp://guest:guest@localhost:5672/", "AMQP (RabbitMQ) address")
 	mysqlDSN  = flag.String("mysql", "root:rootpassword@tcp(localhost:3306)/im_db?parseTime=true", "MySQL DSN")
 	grpcAddr  = flag.String("grpc", ":50051", "gRPC service address")
+	etcdAddr  = flag.String("etcd", "localhost:2379", "Etcd address")
 
 	redisClient *redis.Client
 	amqpConn    *amqp.Connection
@@ -460,6 +462,19 @@ func main() {
 		service.GlobalWriter.Stop()
 		log.Println("AsyncWriter flushed and stopped.")
 	}
+
+	// *** Etcd Registration ***
+	register, err := discovery.NewServiceRegister([]string{*etcdAddr})
+	if err != nil {
+		log.Fatalf("Failed to create Etcd register: %v", err)
+	}
+	// Service Name: chat/logic, Addr: *grpcAddr (should be reachable IP in production)
+	// For local docker, we might need an advertised address flag, but for now using *grpcAddr
+	if err := register.Register(context.Background(), "chat/logic", *grpcAddr, 5); err != nil {
+		log.Fatalf("Failed to register service to Etcd: %v", err)
+	}
+	defer register.Close()
+	log.Printf("Service registered to Etcd: %s @ %s", "chat/logic", *grpcAddr)
 
 	s.GracefulStop()
 }

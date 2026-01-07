@@ -1,6 +1,7 @@
 package main
 
 import (
+	"chat/common/discovery"
 	"chat/common/pb"
 	"context"
 	"encoding/json"
@@ -53,7 +54,8 @@ var (
 	gatewayID = flag.String("id", "gw1", "gateway instance ID")
 	redisAddr = flag.String("redis", "localhost:6379", "Redis address")
 	amqpAddr  = flag.String("amqp", "amqp://guest:guest@localhost:5672/", "AMQP address")
-	logicAddr = flag.String("logic", "localhost:50051", "Logic service gRPC address") // New flag
+	logicAddr = flag.String("logic", "etcd:///chat/logic", "Logic service address (etcd target)")
+	etcdAddr  = flag.String("etcd", "localhost:2379", "Etcd address")
 
 	redisClient *redis.Client
 	amqpConn    *amqp.Connection
@@ -500,8 +502,14 @@ func main() {
 	defer amqpChannel.Close()
 	defer redisClient.Close()
 
-	// *** Init gRPC Client ***
-	conn, err := grpc.Dial(*logicAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// *** Init gRPC Client with Etcd Resolver ***
+	etcdResolver := discovery.NewEtcdResolver([]string{*etcdAddr})
+
+	conn, err := grpc.Dial(*logicAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(etcdResolver),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
+	)
 	if err != nil {
 		log.Fatalf("did not connect to Logic: %v", err)
 	}
